@@ -405,7 +405,8 @@ class NiPCIe6363AcquisitionWorker(Worker):
             #self.to_parent.put(['error', message])
             # TODO: Tell the GUI process that this has a problem some how (status check?)
             
-    def setup_task(self):
+    def setup_task(self, acquisition_trigger=None):
+        self.acquisition_trigger = acquisition_trigger
         self.logger.debug('setup_task')
         #DAQmx Configure Code
         with self.daqlock:
@@ -440,7 +441,10 @@ class NiPCIe6363AcquisitionWorker(Worker):
                     
             if self.buffered:
                 #set up start on digital trigger
-                self.task.CfgDigEdgeStartTrig(self.clock_terminal,DAQmx_Val_Rising)
+                if self.acquisition_trigger is not None:
+                    self.task.CfgDigEdgeStartTrig(self.acquisition_trigger,DAQmx_Val_Rising)
+                else:
+                    self.task.CfgDigEdgeStartTrig(self.clock_terminal,DAQmx_Val_Rising)
             
             #DAQmx Start Code
             self.task.StartTask()
@@ -476,6 +480,7 @@ class NiPCIe6363AcquisitionWorker(Worker):
         self.h5_file = h5file
         # read channels, acquisition rate, etc from H5 file
         h5_chnls = []
+        acquisition_trigger = None
         with h5py.File(h5file,'r') as hdf5_file:
             group =  hdf5_file['/devices/'+device_name]
             device_properties = labscript_utils.properties.get(hdf5_file, device_name, 'device_properties')
@@ -484,6 +489,7 @@ class NiPCIe6363AcquisitionWorker(Worker):
             if 'analog_in_channels' in device_properties:
                 h5_chnls = device_properties['analog_in_channels'].split(', ')
                 self.buffered_rate = device_properties['acquisition_rate']
+                acquisition_trigger = device_properties['acquisition_trigger']
             else:
                self.logger.debug("no input channels")
         # combine static channels with h5 channels (using a set to avoid duplicates)
@@ -504,7 +510,7 @@ class NiPCIe6363AcquisitionWorker(Worker):
         else:
             self.buffered_data = numpy.zeros((1,len(self.buffered_channels)),dtype=numpy.float64)
         
-        self.setup_task()   
+        self.setup_task(acquisition_trigger=acquisition_trigger)   
 
         return {}
     
@@ -533,6 +539,7 @@ class NiPCIe6363AcquisitionWorker(Worker):
             if self.buffered_data_list:
                 self.buffered_data = numpy.zeros(len(self.buffered_data_list)*1000,dtype=dtypes)
                 for i, data in enumerate(self.buffered_data_list):
+                    self.logger.debug('self.buffered_channels: %s self.ai_read.value: %s'%(str(len(self.buffered_channels)), self.ai_read.value))
                     data.shape = (len(self.buffered_channels),self.ai_read.value)              
                     for j, (chan, dtype) in enumerate(dtypes):
                         self.buffered_data[chan][i*1000:(i*1000)+1000] = data[j,:]

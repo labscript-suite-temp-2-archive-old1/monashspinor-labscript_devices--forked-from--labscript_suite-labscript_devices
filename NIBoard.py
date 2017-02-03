@@ -13,9 +13,9 @@ class NIBoard(IntermediateDevice):
     description = 'generic_NI_Board'
     
     @set_passed_properties(property_names = {
-        "device_properties":["acquisition_rate", "MAX_name"]}
+        "device_properties":["acquisition_rate", "MAX_name", "acquisition_trigger"]}
         )
-    def __init__(self, name, parent_device, clock_terminal, MAX_name=None, acquisition_rate=0):
+    def __init__(self, name, parent_device, clock_terminal, MAX_name=None, acquisition_rate=0, acquisition_trigger=None):
         IntermediateDevice.__init__(self, name, parent_device)
         self.acquisition_rate = acquisition_rate
         self.clock_terminal = clock_terminal
