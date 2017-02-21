@@ -688,20 +688,25 @@ class NiPCIe6363WaitMonitorWorker(Worker):
                     # Did the wait finish of its own accord?
                     if half_period is not None:
                         # It did, we are now at the end of that wait:
+                        logger.info('Wait completed')
                         current_time = wait['time']
                         # Wait for the end of the pulse:
                         current_time += self.wait_for_edge()
                     else:
+                        logger.info('Wait timed out; retriggering clock with %.3e s pulse (%s edge)' % (pulse_width, self.trigger_edge_type))
                         # It timed out. Better trigger the clock to resume!.
                         self.send_resume_trigger(pulse_width)
                         # Wait for it to respond to that:
+                        logger.info('Waiting for edge on WaitMonitor')
                         self.wait_for_edge()
                         # Alright, *now* we're at the end of the wait.
+                        logger.info('Wait completed')
                         current_time = wait['time']
                         # And wait for the end of the pulse:
                         current_time += self.wait_for_edge()
 
                 # Inform any interested parties that waits have all finished:
+                logger.info('All waits finished')
                 self.all_waits_finished.post(self.h5_file)
             except Exception:
                 if self.abort:
@@ -711,13 +716,21 @@ class NiPCIe6363WaitMonitorWorker(Worker):
     
     def send_resume_trigger(self, pulse_width):
         written = int32()
-        # go high:
-        self.timeout_task.WriteDigitalLines(1,True,1,DAQmx_Val_GroupByChannel,numpy.ones(1, dtype=numpy.uint8),byref(written),None)
+        if self.trigger_edge_type == 'rising':
+            trigger_value = 1
+            rearm_value = 0
+        elif self.trigger_edge_type == 'falling':
+            trigger_value = 0
+            rearm_value = 1
+        else:
+            raise ValueError('trigger_edge_type of %s_%s must be either "rising" or "falling".' % (self.device_name, self.worker_name))            
+        # Triggering edge:
+        self.timeout_task.WriteDigitalLines(1, True, 1, DAQmx_Val_GroupByChannel, np.array([trigger_value], dtype=np.uint8), byref(written), None)
         assert written.value == 1
-        # Wait however long we observed the first pulse of the experiment to be:
+        # Wait however long we observed the first pulse of the experiment to be
         time.sleep(pulse_width)
-        # go high:
-        self.timeout_task.WriteDigitalLines(1,True,1,DAQmx_Val_GroupByChannel,numpy.ones(1, dtype=numpy.uint8),byref(written),None)
+        # Rearm trigger
+        self.timeout_task.WriteDigitalLines(1, True, 1, DAQmx_Val_GroupByChannel, np.array([rearm_value], dtype=np.uint8), byref(written), None)
         assert written.value == 1
         
     def stop_task(self):
@@ -751,6 +764,11 @@ class NiPCIe6363WaitMonitorWorker(Worker):
             acquisition_connection = dataset.attrs['wait_monitor_acquisition_connection']
             timeout_device = dataset.attrs['wait_monitor_timeout_device']
             timeout_connection = dataset.attrs['wait_monitor_timeout_connection']
+            try:
+                self.trigger_edge_type = dataset.attrs['wait_monitor_trigger_edge_type']
+            # Backwards compatibility with labscript <= 2.2.0
+            except KeyError:
+                self.trigger_edge_type = 'rising'
             self.wait_table = dataset[:]
         # Only do anything if we are in fact the wait_monitor device:
         if timeout_device == device_name or acquisition_device == device_name:
