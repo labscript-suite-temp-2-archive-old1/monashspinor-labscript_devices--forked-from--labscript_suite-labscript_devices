@@ -174,10 +174,10 @@ from blacs.device_base_class import DeviceTab
 class MOGLabsXRF421Tab(DeviceTab):
     def initialise_GUI(self):        
         # Capabilities
-        self.base_units =    {'freq': 'Hz',    'amp': 'Arb',   'phase': 'Degrees'}
+        self.base_units =    {'freq': 'Hz',    'amp': '%',   'phase': 'Degrees'}
         self.base_min =      {'freq': 20.0e6,  'amp': 0,       'phase': 0}
         self.base_max =      {'freq': 170.0e6, 'amp': 1,       'phase': 360}
-        self.base_step =     {'freq': 1.0e6,   'amp': 0.001,   'phase': 1}
+        self.base_step =     {'freq': 1.0e6,   'amp': 0.1,     'phase': 1}
         self.base_decimals = {'freq': 1,       'amp': 4,       'phase': 3} # TODO: find out what the phase precision is!
         self.num_DDS = 2
         
