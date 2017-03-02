@@ -11,7 +11,9 @@
 #                                                                   #
 #####################################################################
 from labscript_devices import labscript_device, BLACS_tab, BLACS_worker, runviewer_parser
-from labscript import Device, PseudoclockDevice, Pseudoclock, ClockLine, IntermediateDevice, DigitalQuantity, DigitalOut, DDS, config, startupinfo, LabscriptError, set_passed_properties
+from labscript import Device, PseudoclockDevice, Pseudoclock, ClockLine, IntermediateDevice, DigitalQuantity, DigitalOut, DDS
+from labscript import config, startupinfo, LabscriptError, set_passed_properties
+from labscript_utils.unitconversions import MOGLabsDDSFreqConversion, MOGLabsDDSAmpConversion
 import numpy as np
 
 # Global variables
@@ -23,32 +25,6 @@ AMPL_BITS = 14
 PHASE_BITS = 16
 FREQ_MIN = 20.0e6
 FREQ_MAX = 400e6
-
-#================ CONVERSION FUNCTIONS ==========================
-def int_to_dBm(m):
-    p = np.array([-2.498366e-5, 8.789253e-4, -1.324752e-2, 1.318304e-1, -1.036049e0, 1.123359e1, -5.548867e1])
-    i = np.log2(m+1)
-    return np.polyval(p, i)
-
-def hex_to_dBm(h):
-    return int_to_dBm(int(h, 16))
-
-def dBm_to_int(dBm):
-    p = [1.286456E-09, -2.766252E-08, -7.258013E-07, 7.156181E-06, 2.620427E-04, 1.660531E-01, 7.395134E+00]
-    i = np.polyval(p, dBm)
-    return np.int16(2**i-1+0.5)
-
-def dBm_to_hex(dBm):
-    return hex(dBm_to_int(dBm))
-
-def frac_to_dBm(x):
-    return int_to_dBm((2**AMPL_BITS-1)*x)
-
-def dBm_to_frac(dBm):
-    return (dBm_to_int(dBm)+1.)/2.**AMPL_BITS
-
-def frac_to_int(x):
-    return np.int16(2**AMPL_BITS*x-1+0.5)
 
 # Define a MOGBlasterPseudoclock that only accepts one child clockline
 class MOGBlasterPseudoclock(Pseudoclock):    
@@ -184,11 +160,11 @@ from blacs.device_base_class import DeviceTab
 class MOGBlasterTab(DeviceTab):
     def initialise_GUI(self):
         # Capabilities
-        self.base_units =    {'freq': 'Hz',    'amp': 'frac',   'phase': 'Degrees'}
-        self.base_min =      {'freq': 20.0e6,  'amp': 0,       'phase': 0}
-        self.base_max =      {'freq': 170.0e6, 'amp': 1,       'phase': 360}
-        self.base_step =     {'freq': 1.0e6,   'amp': 0.001,   'phase': 1}
-        self.base_decimals = {'freq': 1,       'amp': 4,       'phase': 3} # TODO: find out what the phase precision is!
+        self.base_units =    {'freq': 'MHz', 'amp': 'int',          'phase': 'Degrees'}
+        self.base_min =      {'freq': 20.0,  'amp': 0,              'phase': 0}
+        self.base_max =      {'freq': 170.0, 'amp': 2**AMPL_BITS-1, 'phase': 360}
+        self.base_step =     {'freq': 1.0,   'amp': 1,              'phase': 1}
+        self.base_decimals = {'freq': 3,     'amp': 0,              'phase': 3} # TODO: find out what the phase precision is!
         self.num_DDS = 2
         self.num_DO = 8
 
@@ -310,6 +286,8 @@ class MOGBlasterWorker(Worker):
         self.timeout = timeout # How long do we wait until we assume that the MOGBlaster is dead? (in seconds)
         self.check = check
         self._DEBUG = debug
+        self.freq_conv = MOGLabsDDSFreqConversion()
+        self.amp_conv = MOGLabsDDSAmpConversion({'calibration_file': 'C:\\labscript_suite\\labscript_utils\\unitconversions\\MOGLabsDDS.csv'})
 
         # See if the RFBlaster connects
         self.reconnect(self.timeout, self.check)
@@ -494,7 +472,7 @@ class MOGBlasterWorker(Worker):
         for k, x in zip(keys, val_strings[:3]):
             vals[k] = float(x)
         vals['freq'] *= 1e6
-        vals['amp'] = dBm_to_frac(vals['amp'])
+        vals['amp'] = self.amp_conv.dBm_to_frac(vals['amp'])
         vals['gate'] = not any([x.lower().endswith('off') for x in val_strings[4:]])
         wait = any([x.lower().startswith('trig') for x in val_strings[4:]])
         return vals
@@ -539,15 +517,18 @@ class MOGBlasterWorker(Worker):
         try:
             results = {}
             for i in [1, 2]:
-                # mog_vals = {key: self.get_val(key, i) for key in ['FREQ', 'POW', 'PHASE']}
-                # status = self.get_status(i)
-                # vals = {}
-                # vals['freq'] = mog_vals['FREQ']
-                # vals['amp'] = mog_vals['POW']
-                # vals['phase'] = mog_vals['PHASE']
-                # vals['gate'] = status['SIG']
-                response = self.ask('TABLE,ENTRY,%i,1' % i)
-                vals = self.parse_entry(response)
+                # Check the length of the programmed table
+                table_length = self.ask('TABLE,LENGTH,%i' % i)
+                table_length = int(table_length.split()[0])
+                if table_length:
+                    response = self.ask('TABLE,ENTRY,%i,1' % i)
+                    vals = self.parse_entry(response)
+                else:
+                    vals = {}
+                    vals['freq'] = 80.0e6
+                    vals['amp'] = 0.
+                    vals['phase'] = 0.
+                    vals['gate'] = False
                 results['dds %d' % (i-1)] = vals
         except socket.timeout:
             raise Exception('Failed to check remote values. Timed out.')
@@ -569,7 +550,7 @@ class MOGBlasterWorker(Worker):
                 self.cmd('TABLE,LENGTH,%i,2' % i)
                 table_length = 2
             # Create two short instructions with the new front_panel_values, wait on the second
-            command_string = 'TABLE,ENTRY,%i,line,%f,0x%x,%f,1' % (i, vals['freq']/1e6, frac_to_int(vals['amp']), vals['phase'])
+            command_string = 'TABLE,ENTRY,%i,line,%f,0x%x,%f,1' % (i, vals['freq']/1e6, vals['amp'], vals['phase'])
             if not vals['gate']:
                 command_string += ',OFF'
             self.cmd(command_string.replace('line', '1'))
@@ -630,7 +611,7 @@ class MOGBlasterWorker(Worker):
                     if True:
                         ix = i+2    # First two instructions are for static updates
                         ix += 1     # mogrf indexing begins at 1
-                        inst = 'TABLE,ENTRY,%i,%i,%f,0x%x,%f,%f' % (ch, ix, new_vals['freq']/1e6, frac_to_int(new_vals['amp']), new_vals['phase'])
+                        inst = 'TABLE,ENTRY,%i,%i,%f,0x%x,%f,%f' % (ch, ix, new_vals['freq']/1e6, self.amp_conv.frac_to_base(new_vals['amp']), new_vals['phase'])
                         if not new_vals['dds_en']:
                             inst += ',OFF'
                         self.logger.debug('Programming table entry %i of channel %i' % (ix, ch))
