@@ -14,6 +14,7 @@ from labscript_devices import labscript_device, BLACS_tab, BLACS_worker, runview
 from labscript import Device, PseudoclockDevice, Pseudoclock, ClockLine, IntermediateDevice, DigitalQuantity, DigitalOut, DDS
 from labscript import config, startupinfo, LabscriptError, set_passed_properties
 from labscript_utils.unitconversions import MOGLabsDDSFreqConversion, MOGLabsDDSAmpConversion
+from labscript_utils.setup_logging import setup_logging
 import numpy as np
 
 # Global variables
@@ -132,6 +133,11 @@ class MOGBlaster(PseudoclockDevice):
             quantised_data['dds_en%d' % dds] = data['dds_en%d' % dds]
         group.create_dataset('QUANTISED_DATA', compression=config.compression, data=quantised_data)
 
+        # When should the MOGBlaster wait for a trigger?
+        trigger_times = self.trigger_times
+        if trigger_times is not None:
+            group['TABLE_DATA'].attrs.create('trigger_times', trigger_times)
+
 
 class MOGBlasterDirectOutputs(IntermediateDevice):
     description = 'MOGLabs-XRF421 DDS outputs'
@@ -148,7 +154,18 @@ class MOGBlasterDirectOutputs(IntermediateDevice):
             else:
                 raise LabscriptError('You cannot specify a digital gate ' +
                                      'for a DDS connected to %s. '% (self.name) + 
-                                     'The digital gate is always internal to the MOGBlaster.')                                    
+                                     'The digital gate is always internal to the MOGBlaster.')
+
+    def get_default_unit_conversion_classes(self, device):
+        """Child devices call this during their __init__ (with themselves
+        as the argument) to check if there are certain unit calibration
+        classes that they should apply to their outputs, if the user has
+        not otherwise specified a calibration class"""
+        if device.connection in ['dds 0', 'dds 1']:
+            # Default calibration classes for the non-static channels:
+            return MOGLabsDDSFreqConversion, MOGLabsDDSAmpConversion, None
+        else:
+            return None, None, None                                 
 
 
 from blacs.tab_base_classes import Worker, define_state
@@ -160,11 +177,11 @@ from blacs.device_base_class import DeviceTab
 class MOGBlasterTab(DeviceTab):
     def initialise_GUI(self):
         # Capabilities
-        self.base_units =    {'freq': 'MHz', 'amp': 'int',          'phase': 'Degrees'}
-        self.base_min =      {'freq': 20.0,  'amp': 0,              'phase': 0}
-        self.base_max =      {'freq': 170.0, 'amp': 2**AMPL_BITS-1, 'phase': 360}
-        self.base_step =     {'freq': 1.0,   'amp': 1,              'phase': 1}
-        self.base_decimals = {'freq': 3,     'amp': 0,              'phase': 3} # TODO: find out what the phase precision is!
+        self.base_units =    {'freq': 'Hz',    'amp': 'int',          'phase': 'Degrees'}
+        self.base_min =      {'freq': 20.0e6,  'amp': 0,              'phase': 0}
+        self.base_max =      {'freq': 170.0e6, 'amp': 2**AMPL_BITS-1, 'phase': 360}
+        self.base_step =     {'freq': 1.0e6,   'amp': 1,              'phase': 1}
+        self.base_decimals = {'freq': 3,       'amp': 0,              'phase': 3} # TODO: find out what the phase precision is!
         self.num_DDS = 2
         self.num_DO = 8
 
@@ -228,7 +245,7 @@ class MOGBlasterTab(DeviceTab):
 
         # Set the capabilities of this device
         self.supports_remote_value_check(True)
-        self.supports_smart_programming(False) 
+        self.supports_smart_programming(True)
     
     def get_child_from_connection_table(self, parent_device_name, port):
         # This is a direct output, let's search for it on the internal intermediate device called 
@@ -282,22 +299,32 @@ class MOGBlasterWorker(Worker):
         global socket; import socket
         global select; import select
         global h5py; import labscript_utils.h5_lock, h5py
-        self.smart_cache = {'QUANTISED_DATA': ''}
+        self.logger = setup_logging(self.device_name)
+        self.logger.info('init: Started logging')
+        self.smart_cache = {'QUANTISED_DATA': '', 'TABLE_DATA': ''}
         self.timeout = timeout # How long do we wait until we assume that the MOGBlaster is dead? (in seconds)
         self.check = check
         self._DEBUG = debug
         self.freq_conv = MOGLabsDDSFreqConversion()
-        self.amp_conv = MOGLabsDDSAmpConversion({'calibration_file': 'C:\\labscript_suite\\labscript_utils\\unitconversions\\MOGLabsDDS.csv'})
+        self.amp_conv = MOGLabsDDSAmpConversion()
+        self.first_table = False
 
         # See if the RFBlaster connects
         self.reconnect(self.timeout, self.check)
         
+        # TODO: Find out what this does?
         self._last_program_manual_values = {}
         
+        # Get each channel into a well defined state at startup, ready for program_manual and and transition_to_buffered
         for i in [1, 2]:
-            self.cmd('MODE,%i,TSB' % i)               # set into table mode
-            # self.cmd('TABLE,REARM,%i,ON' % i)       # enable table rearm
-            # self.cmd('TABLE,RESTART,%i,ON' % i)     # enable table restart
+            # self.cmd('ON,%i,POW' % i)             # turn on the amplifiers
+            self.cmd('MODE,%i,TSB' % i)             # set into table mode
+            self.cmd('TABLE,TRIGSYNC,1')            # trigger sync (CH2 also starts on falling edge of pin3 of DB15)
+            self.cmd('TABLE,LENGTH,%i,2' % i)       # just use two dummy instructions until we get a fresh table
+            self.cmd('TABLE,SYNC,0')                # TODO: change this to enable synchronous table mode of DDS channels (CH1 master)
+            # self.cmd('TABLE,REARM,%i,ON' % i)     # enable table rearm
+            # self.cmd('TABLE,RESTART,%i,OFF' % i)    # disable table restart (until first table is programmed)
+            self.cmd('TABLE,RESTART,%i,ON' % i)    # enable automatic table restart
 
     #================ GENERIC COMMUNICATIONS METHODS ================
     def reconnect(self, timeout=DEFAULT_TIMEOUT, check=True):
@@ -327,6 +354,7 @@ class MOGBlasterWorker(Worker):
         if resp.startswith('OK'):
             return resp
         else:
+            self.logger.error(cmd)
             raise Exception(resp)
         
     def ask(self, cmd):
@@ -472,7 +500,7 @@ class MOGBlasterWorker(Worker):
         for k, x in zip(keys, val_strings[:3]):
             vals[k] = float(x)
         vals['freq'] *= 1e6
-        vals['amp'] = self.amp_conv.dBm_to_frac(vals['amp'])
+        vals['amp'] = self.amp_conv.dBm_to_base(vals['amp'])
         vals['gate'] = not any([x.lower().endswith('off') for x in val_strings[4:]])
         wait = any([x.lower().startswith('trig') for x in val_strings[4:]])
         return vals
@@ -513,7 +541,7 @@ class MOGBlasterWorker(Worker):
 
     #================ METHODS REQUIRED BY BLACS ======================
     def check_remote_values(self):
-        self.logger.debug('Checking remote values.')
+        self.logger.info('Checking remote values.')
         try:
             results = {}
             for i in [1, 2]:
@@ -550,15 +578,16 @@ class MOGBlasterWorker(Worker):
                 self.cmd('TABLE,LENGTH,%i,2' % i)
                 table_length = 2
             # Create two short instructions with the new front_panel_values, wait on the second
-            command_string = 'TABLE,ENTRY,%i,line,%f,0x%x,%f,1' % (i, vals['freq']/1e6, vals['amp'], vals['phase'])
+            command_string = 'TABLE,ENTRY,%i,line,%f,0x%x,%f,1' % (i, self.freq_conv.MHz_from_base(vals['freq']), vals['amp'], vals['phase'])
             if not vals['gate']:
                 command_string += ',OFF'
             self.cmd(command_string.replace('line', '1'))
             if table_length > 2:
-                command_string += ',TRIG'
+                command_string += ',TRIG'     # Make the second instruction wait on a falling edge of the DB15/SEQ input (pin 3)
             self.cmd(command_string.replace('line', '2'))
             # Stop the table and restart it to load the new values
             self.cmd('TABLE,STOP,%i' % i)
+            # self.cmd('TABLE,ARM,%i' % i)
             self.cmd('TABLE,START,%i' % i)
         return self.check_remote_values()
         
@@ -578,6 +607,8 @@ class MOGBlasterWorker(Worker):
             group = hdf5_file['devices'][device_name]
             if 'TABLE_DATA' in group:
                 table_data = group['TABLE_DATA'][:]
+                trigger_times = group['TABLE_DATA'].attrs.get('trigger_times', default=[])
+                trigger_ix = 0
             if 'QUANTISED_DATA' in group:
                 quantised_data = group['QUANTISED_DATA'][:]
 
@@ -591,41 +622,63 @@ class MOGBlasterWorker(Worker):
             oldtable = self.smart_cache['TABLE_DATA']
             # Check the length of the programmed table
             for i in [1, 2]:
-                self.logger.debug('Checking length of table for channel %i' % i)
+                self.logger.info('Checking length of table for channel %i' % i)
                 table_length = self.ask('TABLE,LENGTH,%i' % i)
+                table_length = int(table_length.split()[0])
                 # If necessary, change the number of table entries
                 if table_length != len(data) + 2:
-                    self.logger('Channel %i table has %i entries, but we need %i. Reshaping table.' % (i, table_length, len(data)+2))
+                    self.logger.info('Channel %i table has %i entries, but we need %i. Reshaping table.' % (i, table_length, len(data)+2))
                     self.cmd('TABLE,LENGTH,%i,%i' % (i, len(data)+2))
+
+            # Calculate the instruction durations
+            durations = np.diff(data['time'])   # TODO: Store the durations instead of absolute times in TABLE_DATA
 
             # Program each row of the table
             for i, line in enumerate(data):
                 # For each row, program each channel
                 for ch in [1, 2]:
-                    old_vals = {}
                     new_vals = {}
+                    old_vals = {}
                     for key in ['freq', 'amp', 'phase', 'dds_en']:
-                        new_vals[key] = line['%s%d' % (key, ch)]
-                        old_vals[key] = oldtable[i-1]['%s%d' % (key, ch)]
-                    # if fresh or i >= len(oldtable) or new_vals != old_vals:
-                    if True:
+                        new_vals[key] = line['%s%d' % (key, ch-1)]
+                        if i < len(oldtable):
+                           old_vals[key] = oldtable[i]['%s%d' % (key, ch-1)]
+                    # if fresh or i >= len(oldtable) or (line['time'], line['freq%d' % (ch-1)], line['phase%d' % (ch-1)], line['amp%d' % (ch-1)]) != (oldtable[i]['time'], oldtable[i]['freq%d' % (ch-1)], oldtable[i]['phase%d' % (ch-1)], oldtable[i]['amp%d' % (ch-1)]):
+                    if True or i >= len(oldtable) or line['time'] != oldtable[i]['time'] or old_vals != new_vals:
                         ix = i+2    # First two instructions are for static updates
                         ix += 1     # mogrf indexing begins at 1
-                        inst = 'TABLE,ENTRY,%i,%i,%f,0x%x,%f,%f' % (ch, ix, new_vals['freq']/1e6, self.amp_conv.frac_to_base(new_vals['amp']), new_vals['phase'])
+                        if i < len(data)-1:
+                            duration = durations[i]*1e6
+                        else:
+                            duration = 1
+                        inst = 'TABLE,ENTRY,%i,%i,%f,0x%x,%f,%f' % (ch, ix, self.freq_conv.MHz_from_base(new_vals['freq']), int(new_vals['amp']), new_vals['phase'], duration)
+                        # Should the channel be disabled during this intruction?
                         if not new_vals['dds_en']:
                             inst += ',OFF'
                         self.logger.debug('Programming table entry %i of channel %i' % (ix, ch))
                         self.cmd(inst)
+            for ch in [1, 2]:
+                # Stop the table and restart it to load the new values
+                self.cmd('TABLE,STOP,%i' % ch)
+                self.cmd('TABLE,START,%i' % ch)           
             for i in range(self.num_DDS):
                 # Find the final value from the human-readable part of the h5 file to use for
                 # the front panel values at the end
-                self.final_values['dds %d' % i] = {'freq': group['TABLE_DATA']["freq%d" % i][-1],
-                                                   'amp': group['TABLE_DATA']["amp%d" % i][-1],
-                                                   'phase': group['TABLE_DATA']["phase%d" % i][-1],
-                                                   'gate': group['TABLE_DATA']["dds_en%d" % i][-1]
+                self.final_values['dds %d' % i] = {'freq': data["freq%d" % i][-1],
+                                                   'amp': data["amp%d" % i][-1],
+                                                   'phase': data["phase%d" % i][-1],
+                                                   'gate': data["dds_en%d" % i][-1]
                                                   }
             for i in range(self.num_DO):
                 self.final_values['flag %d' % i] = 0
+
+            # Store the table for future smart programming comparisons:
+            try:
+                self.smart_cache['TABLE_DATA'][:len(data)] = data
+                self.logger.info('Stored new table as subset of old table')
+            except: # new table is longer than old table
+                self.smart_cache['TABLE_DATA'] = data
+                self.logger.info('New table is longer than old table and has replaced it.')
         return self.final_values
                  
     def abort_transition_to_buffered(self):
