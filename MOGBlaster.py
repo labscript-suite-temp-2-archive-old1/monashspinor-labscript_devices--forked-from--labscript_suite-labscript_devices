@@ -319,12 +319,12 @@ class MOGBlasterWorker(Worker):
         for i in [1, 2]:
             # self.cmd('ON,%i,POW' % i)             # turn on the amplifiers
             self.cmd('MODE,%i,TSB' % i)             # set into table mode
-            self.cmd('TABLE,TRIGSYNC,1')            # trigger sync (CH2 also starts on falling edge of pin3 of DB15)
             self.cmd('TABLE,LENGTH,%i,2' % i)       # just use two dummy instructions until we get a fresh table
-            self.cmd('TABLE,SYNC,0')                # TODO: change this to enable synchronous table mode of DDS channels (CH1 master)
-            # self.cmd('TABLE,REARM,%i,ON' % i)     # enable table rearm
-            # self.cmd('TABLE,RESTART,%i,OFF' % i)    # disable table restart (until first table is programmed)
-            self.cmd('TABLE,RESTART,%i,ON' % i)    # enable automatic table restart
+            self.cmd('TABLE,RESTART,%i,OFF' % i)    # disable automatic table restart
+        self.cmd('TABLE,REARM,1,OFF')               # disable automatic table rearm on CH1
+        self.cmd('TABLE,REARM,2,ON')                # enable automatic table rearm on CH2
+        self.cmd('TABLE,TRIGSYNC,1')                # trigger sync (CH2 also starts on falling edge of pin3 of DB15)
+        self.cmd('TABLE,SYNC,1')                    # enable synchronous table mode of DDS channels (CH1 master)
 
     #================ GENERIC COMMUNICATIONS METHODS ================
     def reconnect(self, timeout=DEFAULT_TIMEOUT, check=True):
@@ -366,20 +366,6 @@ class MOGBlasterWorker(Worker):
         if resp.startswith('ERR:'):
             raise Exception(resp[4:].strip())
         return resp
-        
-    def ask_dict(self, cmd):
-        "Send a request which returns a dictionary response"
-        resp = self.ask(cmd)
-        # might start with "OK"
-        if resp.startswith('OK'): resp = resp[3:].strip()
-        # expect a colon in there
-        if not ':' in resp: raise Exception('Response to "%s" not a dictionary'%cmd)
-        # response could be comma-delimited (new) or newline-delimited (old)
-        vals = collections.OrderedDict()
-        for entry in returnsp.split(',' if ',' in resp else '\n'):
-            name, val = entry.split(':')
-            vals[name.strip()] = val.strip()
-        return vals
         
     def ask_bin(self, cmd):
         "Send a request which returns a binary response"
@@ -460,84 +446,28 @@ class MOGBlasterWorker(Worker):
             print '<< RECV_RAW got', len(buffer)
             print '<<', repr(buffer)
         return buffer
-        
-    def set_timeout(self, val):
-        if self.is_usb:
-            old = self.dev.timeout
-            self.dev.timeout = val
-            return old
-        else:
-            old = self.dev.gettimeout()
-            self.dev.settimeout(val)
-            return old
-
-    def set_get(self, name, val):
-        "Set specified name and then query it"
-        self.cmd('set,'+name+','+str(val)+'\n')
-        actualval = self.ask('get,'+name)
-        if self._DEBUG: print 'SET',name,'=',repr(val),repr(actualval)
-        return actualval
 
     def close(self):
         if hasattr(self, 'dev'): self.dev.close()
 
     #================ SPECIFIC COMMUNICATIONS METHODS ================
-    def parse_response(self, response, return_raw=False):
-        units = {'Hz': 1, 'kHz': 1e3, 'MHz': 1e6,
-                 'dBm': 1, 'deg': 1}
-        val, unit, raw = response.split()[-3:]
-        val = float(val) # * units[unit]
-        raw = int(raw.replace('(', '').replace(')', ''), 0)
-        if return_raw:
-            return raw, val
-        else:
-            return val
-
     def parse_entry(self, response):
         val_strings = [s.strip() for s in response.split(',')]
         vals = {}
         keys = ['freq', 'amp', 'phase']
         for k, x in zip(keys, val_strings[:3]):
             vals[k] = float(x)
-        vals['freq'] *= 1e6
+        vals['freq'] = self.freq_conv.MHz_to_base(vals['freq'])
         vals['amp'] = self.amp_conv.dBm_to_base(vals['amp'])
         vals['gate'] = not any([x.lower().endswith('off') for x in val_strings[4:]])
         wait = any([x.lower().startswith('trig') for x in val_strings[4:]])
         return vals
-
-    def get_val(self, key, channel):
-        response = self.ask('%s,%i' % (key, channel))
-        return parse_response(response)
-
-    def set_val(self, key, channel, val):
-        response = self.ask('%s,%i,%f' % (key, channel, val))
-        if not response.startswith('OK'):
-            raise Exception('Failed to set %s of channel %i to %s' % (key, channel, val))
-        return parse_response(response)
 
     def get_status(self, channel):
         response = self.ask('STATUS,%i', channel)
         status = dict([[y.strip() for y in x.split(':')] for x in response.split(',')])
         # status['AMP'] = status.pop('POW')
         return status
-
-    def program_static(self, channel, key, value):
-        if key in ['FREQ', 'POW', 'PHASE']:
-            self.set_val(channel, key, value)
-        elif key == 'SIG':
-            if value in ['OFF', 'off', 0, False]:
-                response = self.ask('OFF,%i,SIG')
-            elif value in ['ON', 'on', 1, True]:
-                response = self.ask('ON,%i,SIG')
-        elif key == 'AMP':
-            if value in ['OFF', 'off', 0, False]:
-                response = self.ask('OFF,%i,POW')
-            elif value in ['ON', 'on', 1, True]:
-                response = self.ask('ON,%i,POW')
-        else:
-            raise TypeError('Quantity name must be one of FREQ, POW, PHASE, SIG, or AMP.')
-        if not response.startswith('OK'):
-            raise Exception('Error: Failed to disable/enable signal/amp on channel %i' % channel)
 
     #================ METHODS REQUIRED BY BLACS ======================
     def check_remote_values(self):
@@ -585,10 +515,10 @@ class MOGBlasterWorker(Worker):
             if table_length > 2:
                 command_string += ',TRIG'     # Make the second instruction wait on a falling edge of the DB15/SEQ input (pin 3)
             self.cmd(command_string.replace('line', '2'))
-            # Stop the table and restart it to load the new values
-            self.cmd('TABLE,STOP,%i' % i)
-            # self.cmd('TABLE,ARM,%i' % i)
-            self.cmd('TABLE,START,%i' % i)
+        # Stop the table and restart it to load the new values
+        self.cmd('TABLE,STOP,1')
+        self.cmd('TABLE,ARM,2')
+        self.cmd('TABLE,START,1')
         return self.check_remote_values()
         
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
@@ -643,8 +573,7 @@ class MOGBlasterWorker(Worker):
                         new_vals[key] = line['%s%d' % (key, ch-1)]
                         if i < len(oldtable):
                            old_vals[key] = oldtable[i]['%s%d' % (key, ch-1)]
-                    # if fresh or i >= len(oldtable) or (line['time'], line['freq%d' % (ch-1)], line['phase%d' % (ch-1)], line['amp%d' % (ch-1)]) != (oldtable[i]['time'], oldtable[i]['freq%d' % (ch-1)], oldtable[i]['phase%d' % (ch-1)], oldtable[i]['amp%d' % (ch-1)]):
-                    if True or i >= len(oldtable) or line['time'] != oldtable[i]['time'] or old_vals != new_vals:
+                    if fresh or i >= len(oldtable) or line['time'] != oldtable[i]['time'] or old_vals != new_vals:
                         ix = i+2    # First two instructions are for static updates
                         ix += 1     # mogrf indexing begins at 1
                         if i < len(data)-1:
@@ -655,12 +584,18 @@ class MOGBlasterWorker(Worker):
                         # Should the channel be disabled during this intruction?
                         if not new_vals['dds_en']:
                             inst += ',OFF'
-                        self.logger.debug('Programming table entry %i of channel %i' % (ix, ch))
+                        # Is this a wait instruction?
+                        if False: # and trigger_ix < len(trigger_times) and line['time'] == trigger_times[trigger_ix]:
+                            inst += ',TRIG'
+                            trigger_ix += 1
+                        self.logger.info('Programming table entry %i of channel %i' % (ix, ch))
+                        self.logger.info(inst)
                         self.cmd(inst)
-            for ch in [1, 2]:
+            for ch in [1]:
                 # Stop the table and restart it to load the new values
                 self.cmd('TABLE,STOP,%i' % ch)
-                self.cmd('TABLE,START,%i' % ch)           
+                self.cmd('TABLE,ARM,2')
+                self.cmd('TABLE,START,%i' % ch)
             for i in range(self.num_DDS):
                 # Find the final value from the human-readable part of the h5 file to use for
                 # the front panel values at the end
@@ -688,8 +623,10 @@ class MOGBlasterWorker(Worker):
         return True
      
     def transition_to_manual(self):
+        # for ch in [1, 2]:
+        #     self.cmd('TABLE,ARM,%i,1' % ch)
         return True
         
     def shutdown(self):
-        # TODO: implement this?
+        self.close()
         pass
