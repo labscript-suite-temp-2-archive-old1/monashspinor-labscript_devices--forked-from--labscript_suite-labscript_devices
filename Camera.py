@@ -52,7 +52,9 @@ class Camera(TriggerableDevice):
         self.sdk = str(SDK)
         self.effective_pixel_size = effective_pixel_size
         self.exposures = []
-        
+        # define frame counter for sequential frame grabs
+        self.frame_counter = 0
+
         # Force uint64 type for serial_number
         self.set_property('serial_number', self.serial_number, location='device_properties')
         
@@ -66,7 +68,10 @@ class Camera(TriggerableDevice):
         TriggerableDevice.__init__(self, name, parent_device, connection, **kwargs)
 
         
-    def expose(self, name, t , frametype, exposure_time=None):
+    def expose(self, name, t , frametype=None, exposure_time=None):
+        # increment frame counter
+        self.frame_counter += 1
+
         if exposure_time is None:
             duration = self.exposure_time
         else:
