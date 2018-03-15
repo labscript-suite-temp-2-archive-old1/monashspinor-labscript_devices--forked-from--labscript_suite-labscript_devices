@@ -52,8 +52,7 @@ class Camera(TriggerableDevice):
         self.sdk = str(SDK)
         self.effective_pixel_size = effective_pixel_size
         self.exposures = []
-        # define frame counter for sequential frame grabs
-        self.frame_counter = 0
+
 
         # Force uint64 type for serial_number
         self.set_property('serial_number', self.serial_number, location='device_properties')
@@ -67,20 +66,44 @@ class Camera(TriggerableDevice):
         
         TriggerableDevice.__init__(self, name, parent_device, connection, **kwargs)
 
-        
-    def expose(self, name, t , frametype=None, exposure_time=None):
-        # increment frame counter
-        self.frame_counter += 1
 
+    
+    def expose(self, name, t , frametype=None, exposure_time=None, frames=1, force=False):
+        """
+        Capture an image(s) via defined camera with arguments
+        Args:
+                name (str): Name of the capture image - identifies what aspect of the experiemnt is being captured
+                            to be stored in experiment file (/camera_name/EXPOSURES). 
+
+                t (float): Global time variable used across shot.
+
+                frametype (str): Image name - if not None then camera server will write the image(s) to shot file.
+
+                exposure_time (float): Exposure time for image capture. If None will be set to class default.
+
+                frames (int): Number of frames to capture. If greater than one then parent device must inherit 
+                              the DigitalQuantity class. Cannot be greater than one with frametime != None unless 
+                              force==True. It should be obvious why you would want a chance to catch this.
+
+                force (bool): As above, catches the possibility of saving 2 GB of images to the output shot file.
+
+        """    
+        # handle the timing calculations (needed for collision checking as well)
         if exposure_time is None:
             duration = self.exposure_time
         else:
-            duration = exposure_time
+            duration = exposure_time*frames
+
         if duration is None:
             raise LabscriptError('Camera %s has not had an exposure_time set as an instantiation argument, '%self.name +
                                  'and one was not specified for this exposure')
+        else:
+            # account for frame number given that frames*None will not occur
+            duration *= frames
+
         if not duration > 0:
             raise LabscriptError("exposure_time must be > 0, not %s"%str(duration))
+        
         # Only ask for a trigger if one has not already been requested by 
         # another camera attached to the same trigger:
         already_requested = False
@@ -89,8 +112,33 @@ class Camera(TriggerableDevice):
                 for _, other_t, _, other_duration in camera.exposures:
                     if t == other_t and duration == other_duration:
                         already_requested = True
+        
+        # set trigger event if not already performed
         if not already_requested:
-            self.trigger_device.trigger(t, duration)
+            if frames > 1:
+
+                # check if DigitalQuantity is a parent class
+                pulse_able = getattr(self.trigger_device, "repeat_pulse_sequence", None)
+                if not callable(pulse_able):
+                    raise LabscriptError("DigitalQuantity is not a parent class of {:}: Pulse sequence instruction unavailable".format(self.name))
+
+                # check if frames are set to be saved and if force condition is set
+                if frametype is None or force:
+                    # period of pulse sequence
+                    period = 2*duration/frames
+                    # total duration of capure event
+                    duration = period*frames
+                    # define the pulse sequence to be repeated
+                    pulse_sequence = [(0, 1), (0.5*period,0)]
+                    # create a pulse train to trigger camera with 50% duty cycle of period 2*(exposure time)
+                    self.trigger_device.repeat_pulse_sequence(t=t, duration=duration, pulse_sequence=pulse_sequence, period=period, samplerate=4e4)
+                
+                else:
+                    raise LabscriptError("Multi-image capture is set to be write {} frames to shot file: Set force=True if this is what you really want".format(frames))
+
+            else:
+                self.trigger_device.trigger(t, duration)
+
         # Check for exposures too close together (check for overlapping 
         # triggers already performed in self.trigger_device.trigger()):
         start = t
@@ -103,9 +151,22 @@ class Camera(TriggerableDevice):
                 raise LabscriptError('%s %s has two exposures closer together than the minimum recovery time: ' %(self.description, self.name) + \
                                      'one at t = %fs for %fs, and another at t = %fs for %fs. '%(t,duration,start,duration) + \
                                      'The minimum recovery time is %fs.'%self.minimum_recovery_time)
-        self.exposures.append((name, t, frametype, duration))
+        
+        # add exposures to h5 file
+        if frames > 1:
+            # store frametype for conditional
+            framename = frametype
+            for ti in np.arange(t,t+period*frames, period): 
+                # check if frame is being force saved and hence needs a unique identifier
+                if frametype is not None or force:
+                    framename = "seq_frame_{0:.3f}".format(t+ti).replace(".","")
+                self.exposures.append((name, ti, framename, period/2))
+        else:   
+            self.exposures.append((name, t, frametype, duration))
+
         return duration
-    
+
+
     def do_checks(self):
         # Check that all Cameras sharing a trigger device have exposures when we have exposures:
         for camera in self.trigger_device.child_devices:
@@ -117,6 +178,7 @@ class Camera(TriggerableDevice):
                                              '%s has an exposure at %fs for %fs, ' % (self.name, start, duration) +
                                              'but there is no matching exposure for %s. ' % camera.name +
                                              'Cameras sharing a trigger must have identical exposure times and durations.')
+
                         
     def generate_code(self, hdf5_file):
         self.do_checks()
