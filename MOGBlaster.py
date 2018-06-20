@@ -165,7 +165,7 @@ class MOGBlasterDirectOutputs(IntermediateDevice):
             # Default calibration classes for the non-static channels:
             return MOGLabsDDSFreqConversion, MOGLabsDDSAmpConversion, None
         else:
-            return None, None, None                                 
+            return None, None, None
 
 
 from blacs.tab_base_classes import Worker, define_state
@@ -176,6 +176,12 @@ from blacs.device_base_class import DeviceTab
 @BLACS_tab
 class MOGBlasterTab(DeviceTab):
     def initialise_GUI(self):
+        # Conversions
+        self.freq_conv = MOGLabsDDSFreqConversion()
+        self.amp_conv = {}
+        self.amp_conv[1] = MOGLabsDDSAmpConversion({'channel': 1})
+        self.amp_conv[2] = MOGLabsDDSAmpConversion({'channel': 2})
+
         # Capabilities
         self.base_units =    {'freq': 'Hz',    'amp': 'int',          'phase': 'Degrees'}
         self.base_min =      {'freq': 20.0e6,  'amp': 0,              'phase': 0}
@@ -189,14 +195,18 @@ class MOGBlasterTab(DeviceTab):
         dds_prop = {}
         for i in range(self.num_DDS): # 2 is the number of DDS outputs on this device
             dds_prop['dds %d' % i] = {}
-            for subchnl in ['freq', 'amp', 'phase']:
-                dds_prop['dds %d' % i][subchnl] = {'base_unit': self.base_units[subchnl],
-                                                   'min': self.base_min[subchnl],
-                                                   'max': self.base_max[subchnl],
-                                                   'step': self.base_step[subchnl],
-                                                   'decimals': self.base_decimals[subchnl]
-                                                }
+            # for subchnl in ['freq', 'amp', 'phase']:
+            #     dds_prop['dds %d' % i][subchnl] = {'base_unit': self.base_units[subchnl],
+            #                                        'min': self.base_min[subchnl],
+            #                                        'max': self.base_max[subchnl],
+            #                                        'step': self.base_step[subchnl],
+            #                                        'decimals': self.base_decimals[subchnl]
+            #                                     }
             dds_prop['dds %d' % i]['gate'] = {}
+        for ch in [1, 2]:
+            dds_prop['dds %d' % (ch-1)]['freq'] = {'base_unit': 'Hz', 'min': self.freq_conv.freq_min, 'max': self.freq_conv.freq_max, 'step': self.freq_conv.df, 'decimals': 3}
+            dds_prop['dds %d' % (ch-1)]['amp'] = {'base_unit': 'int', 'min': self.amp_conv[ch].amp_min, 'max': self.amp_conv[ch].amp_max, 'step': 1, 'decimals': 0}
+            dds_prop['dds %d' % (ch-1)]['phase'] = {'base_unit': 'Degrees', 'min': 0, 'max': 360, 'step': 1, 'decimals': 3}
 
         do_prop = {}
         for i in range(self.num_DO):
@@ -294,7 +304,7 @@ class MOGBlasterTab(DeviceTab):
     
 @BLACS_worker
 class MOGBlasterWorker(Worker):
-    def init(self, timeout=DEFAULT_TIMEOUT, check=True, debug=False):
+    def init(self, timeout=DEFAULT_TIMEOUT, check=True, debug=True):
         global serial; import serial
         global socket; import socket
         global select; import select
@@ -306,7 +316,9 @@ class MOGBlasterWorker(Worker):
         self.check = check
         self._DEBUG = debug
         self.freq_conv = MOGLabsDDSFreqConversion()
-        self.amp_conv = MOGLabsDDSAmpConversion()
+        self.amp_conv = {}
+        self.amp_conv[1] = MOGLabsDDSAmpConversion({'channel': 1})
+        self.amp_conv[2] = MOGLabsDDSAmpConversion({'channel': 2})
         self.first_table = False
 
         # See if the RFBlaster connects
@@ -314,15 +326,29 @@ class MOGBlasterWorker(Worker):
         
         # TODO: Find out what this does?
         self._last_program_manual_values = {}
-        
+
+        # Keep track of whether or not to clear the tables of both channels
+        clear_tables = False 
+
         # Get each channel into a well defined state at startup, ready for program_manual and and transition_to_buffered
-        for i in [1, 2]:
-            # self.cmd('ON,%i,POW' % i)             # turn on the amplifiers
-            self.cmd('MODE,%i,TSB' % i)             # set into table mode
-            self.cmd('TABLE,LENGTH,%i,2' % i)       # just use two dummy instructions until we get a fresh table
-            self.cmd('TABLE,RESTART,%i,OFF' % i)    # disable automatic table restart
+        for ch in [1, 2]:
+            self.cmd('MODE,%i,TSB' % ch)             # set into table mode
+            # self.cmd('ON,%i,POW' % ch)             # turn on the amplifiers
+            # self.cmd('TABLE,LENGTH,%i,2' % ch)       # just use three dummy instructions until we get a fresh table
+            # self.cmd('TABLE,CLEAR,%i' % ch)
+            table_length = self.ask('TABLE,LENGTH,%i' % ch)
+            table_length = int(table_length.split()[0])
+            if table_length < 3:
+                clear_tables = True
+            self.cmd('TABLE,RESTART,%i,OFF' % ch)    # disable automatic table restart
+        # Do we need to clear both tables (a reprogam of these will occur upon check_remote_values)
+        if clear_tables:
+            self.logger.info('Fewer than 2 table entries. Clearing both tables')
+            for ch in [1, 2]:
+                self.cmd('TABLE,CLEAR,%i' % ch)
+        # self.program_manual(startup_values, update_output=False)    # ensure valid initial table entries
         self.cmd('TABLE,REARM,1,OFF')               # disable automatic table rearm on CH1
-        self.cmd('TABLE,REARM,2,ON')                # enable automatic table rearm on CH2
+        self.cmd('TABLE,REARM,2,OFF')                # enable automatic table rearm on CH2
         self.cmd('TABLE,TRIGSYNC,1')                # trigger sync (CH2 also starts on falling edge of pin3 of DB15)
         self.cmd('TABLE,SYNC,1')                    # enable synchronous table mode of DDS channels (CH1 master)
 
@@ -451,14 +477,25 @@ class MOGBlasterWorker(Worker):
         if hasattr(self, 'dev'): self.dev.close()
 
     #================ SPECIFIC COMMUNICATIONS METHODS ================
-    def parse_entry(self, response):
+    def parse_entry(self, response, ch=1):
         val_strings = [s.strip() for s in response.split(',')]
         vals = {}
         keys = ['freq', 'amp', 'phase']
         for k, x in zip(keys, val_strings[:3]):
             vals[k] = float(x)
         vals['freq'] = self.freq_conv.MHz_to_base(vals['freq'])
-        vals['amp'] = self.amp_conv.dBm_to_base(vals['amp'])
+        vals['amp'] = self.amp_conv[ch].dBm_to_base(vals['amp'])
+        vals['gate'] = not any([x.lower().endswith('off') for x in val_strings[4:]])
+        wait = any([x.lower().startswith('trig') for x in val_strings[4:]])
+        return vals
+
+    def parse_hex_entry(self, response):
+        val_strings = [s.strip() for s in response.split(',')]
+        vals = {}
+        keys = ['freq', 'amp', 'phase']
+        for k, x in zip(keys, val_strings[:3]):
+            vals[k] = eval(x)
+        vals['freq'] = self.freq_conv.int_to_base(vals['freq'])
         vals['gate'] = not any([x.lower().endswith('off') for x in val_strings[4:]])
         wait = any([x.lower().startswith('trig') for x in val_strings[4:]])
         return vals
@@ -474,51 +511,71 @@ class MOGBlasterWorker(Worker):
         self.logger.info('Checking remote values.')
         try:
             results = {}
-            for i in [1, 2]:
+            for ch in [1, 2]:
                 # Check the length of the programmed table
-                table_length = self.ask('TABLE,LENGTH,%i' % i)
+                table_length = self.ask('TABLE,LENGTH,%i' % ch)
                 table_length = int(table_length.split()[0])
                 if table_length:
-                    response = self.ask('TABLE,ENTRY,%i,1' % i)
-                    vals = self.parse_entry(response)
+                    response = self.ask('TABLE,HEXENTRY,%i,1' % ch)
+                    vals = self.parse_hex_entry(response)
                 else:
+                    self.logger.info('No table in memory. Returning default values.')
                     vals = {}
                     vals['freq'] = 80.0e6
                     vals['amp'] = 0.
                     vals['phase'] = 0.
                     vals['gate'] = False
-                results['dds %d' % (i-1)] = vals
+                results['dds %d' % (ch-1)] = vals
         except socket.timeout:
             raise Exception('Failed to check remote values. Timed out.')
         for i in range(self.num_DO):
             results['flag %d' % i] = 0
         return results
 
-    def program_manual(self, front_panel_values):
-        self._last_program_manual_values = front_panel_values        
-        for i in [1, 2]:
+    def program_manual(self, front_panel_values, update_output=True):
+        for ch in [1, 2]:
             # Get a dictionary of front panel values for this channel
-            vals = front_panel_values['dds %d' % (i-1)]
+            vals = front_panel_values['dds %d' % (ch-1)]
+            if 'dds %d' % (ch-1) in self._last_program_manual_values:
+                last_vals = self._last_program_manual_values['dds %d' % (ch-1)]
+            else:
+                last_vals = {}
+
+            if vals == last_vals:
+                pass
+            
             # Check the length of the programmed table
-            table_length = self.ask('TABLE,LENGTH,%i' % i)
+            table_length = self.ask('TABLE,LENGTH,%i' % ch)
             table_length = int(table_length.split()[0])
-            # If fewer than two instructions, create an empty table with two entries
-            if table_length < 2:
-                self.cmd('TABLE,CLEAR,%i' % i)
-                self.cmd('TABLE,LENGTH,%i,2' % i)
-                table_length = 2
+
+            # If fewer than three instructions (no buffered output programmed), clear the table
+            if table_length < 3:
+                self.logger.info('No buffered output. Clearing table on channel %i.' % ch)
+                self.cmd('TABLE,CLEAR,%i' % ch)
+
             # Create two short instructions with the new front_panel_values, wait on the second
-            command_string = 'TABLE,ENTRY,%i,line,%f,0x%x,%f,1' % (i, self.freq_conv.MHz_from_base(vals['freq']), vals['amp'], vals['phase'])
+            command_string = 'TABLE,ENTRY,%i,line,%f,0x%x,%f,1' % (ch, self.freq_conv.MHz_from_base(vals['freq']), vals['amp'], vals['phase'])
             if not vals['gate']:
                 command_string += ',OFF'
             self.cmd(command_string.replace('line', '1'))
-            if table_length > 2:
-                command_string += ',TRIG'     # Make the second instruction wait on a falling edge of the DB15/SEQ input (pin 3)
+            command_string += ',TRIG'     # Make the second instruction wait on a falling edge of the DB15/SEQ input (pin 3)
             self.cmd(command_string.replace('line', '2'))
-        # Stop the table and restart it to load the new values
-        self.cmd('TABLE,STOP,1')
-        self.cmd('TABLE,ARM,2')
-        self.cmd('TABLE,START,1')
+            
+            # If no buffered output programmed, program a third (dummy) instruction
+            if table_length < 3:
+                self.cmd(command_string.replace('line', '3').replace(',TRIG', ''))
+                table_length = 3
+
+            # Update the declared table length
+            self.cmd('TABLE,LENGTH,%i,%i' % (ch, table_length))
+
+        if update_output:
+            # Stop the table and restart it to load the new values
+            self.cmd('TABLE,STOP,1')
+            self.cmd('TABLE,ARM,2')
+            self.cmd('TABLE,START,1')
+
+        self._last_program_manual_values = front_panel_values
         return self.check_remote_values()
         
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
@@ -551,14 +608,14 @@ class MOGBlasterWorker(Worker):
             # Get the old data from the smart_cache for comparison (not implemented!)
             oldtable = self.smart_cache['TABLE_DATA']
             # Check the length of the programmed table
-            for i in [1, 2]:
-                self.logger.info('Checking length of table for channel %i' % i)
-                table_length = self.ask('TABLE,LENGTH,%i' % i)
+            for ch in [1, 2]:
+                self.logger.info('Checking length of table for channel %i' % ch)
+                table_length = self.ask('TABLE,LENGTH,%i' % ch)
                 table_length = int(table_length.split()[0])
                 # If necessary, change the number of table entries
                 if table_length != len(data) + 2:
-                    self.logger.info('Channel %i table has %i entries, but we need %i. Reshaping table.' % (i, table_length, len(data)+2))
-                    self.cmd('TABLE,LENGTH,%i,%i' % (i, len(data)+2))
+                    self.logger.info('Channel %i table has %i entries, but we need %i. Reshaping table.' % (ch, table_length, len(data)+2))
+                    self.cmd('TABLE,LENGTH,%i,%i' % (ch, len(data)+2))
 
             # Calculate the instruction durations
             durations = np.diff(data['time'])   # TODO: Store the durations instead of absolute times in TABLE_DATA
